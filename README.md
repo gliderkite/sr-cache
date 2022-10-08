@@ -409,7 +409,93 @@ println!("{price}");        // 10
 ```
 
 
-TODO: error handling with channels?
+## Error handling
+
+As the last section, we are going to briefly talk about error handling and show how we can use the current APIs to signal that a background task raised an error (for example when querying the 3rd-party service to get the price of the electronic components). Because the background tasks run asynchronously, we can expect our error handling to follow the same pattern.
+
+There are at least a couple of ways we could support error handling:
+
+- On a query basis: where we are interested to know if an error occurred when we query the value associated with a given key via the `get` API. In this use case, we could simply define our user type `V` so that it encodes this information in the type itself.
+
+    ```rust
+    use tokio::time::sleep;
+
+    type Value = Result<Component, String>;
+
+    let mut cache = Cache::default();
+
+    async fn update_transistor_price(value: CacheVal<Value>) {
+        async fn query_manufacturer() -> Value {
+            Err("404: Not Found".into())
+        }
+
+        let new_value = query_manufacturer().await;
+        *value.write().await = Some(new_value);
+    }
+
+    cache.insert(
+        ":transistor",
+        TaskArgs {
+            ttl: Duration::from_secs(5),
+            update_interval: Duration::from_millis(500),
+            value: CacheVal::new(Ok(Component { price: 10.0 })),
+            update_fn: update_transistor_price,
+        },
+    );
+
+    sleep(Duration::from_secs(1)).await;
+    let transistor = cache.get(":transistor").await.unwrap();
+    println!("{transistor:?}");     // Err("404: Not Found")
+    ```
+
+- Fully asynchronously: where we are interested to know if an error occurred when it occurs and get notified when this happens. In this case, we can still exploit the possibility of defining our own type `V` to support this feature by sending errors using the [mpsc][26] implementation provided by Tokio.
+
+    ```rust
+    use tokio::sync::mpsc::{self, UnboundedSender};
+
+    type Value = (UnboundedSender<String>, Component);
+
+    let mut cache = Cache::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    async fn update_transistor_price(value: CacheVal<Value>) {
+        async fn query_manufacturer() -> Result<f64, String> {
+            Err("404: Not Found".into())
+        }
+
+        match query_manufacturer().await {
+            Ok(price) => {
+                let mut value = value.write().await;
+                let (_, component) = value.as_mut().unwrap();
+                component.price = price;
+            }
+            Err(e) => {
+                let value = value.read().await;
+                let (tx, _) = value.as_ref().unwrap();
+                tx.send(e).unwrap();
+            }
+        };
+    }
+
+    cache.insert(
+        ":transistor",
+        TaskArgs {
+            ttl: Duration::from_secs(5),
+            update_interval: Duration::from_millis(500),
+            value: CacheVal::new((tx, Component { price: 10.0 })),
+            update_fn: update_transistor_price,
+        },
+    );
+
+    let err = rx.recv().await.unwrap();
+    println!("{err}");          // 404: Not Found
+
+    let transistor = cache
+        .get_map(":transistor", |(_, component)| component.clone())
+        .await
+        .unwrap();
+    println!("{transistor:?}"); // Component { price: 10.0 }
+    ```
 
 
 [1]: https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html
@@ -437,3 +523,4 @@ TODO: error handling with channels?
 [23]: https://doc.rust-lang.org/std/default/trait.Default.html#derivable
 [24]: https://rust-lang.github.io/api-guidelines/interoperability.html#types-eagerly-implement-common-traits-c-common-traits
 [25]: https://docs.rs/tokio/latest/tokio/sync/struct.RwLock.html
+[26]: https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html
