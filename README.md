@@ -1,18 +1,18 @@
 # sr-cache
 
-A periodic self-rehydrating cache.
+A periodic asynchronous self-rehydrating cache.
 
 
 ## Overview
 
-The goal of this little project is to show step by step how to write a small and basic Rust implementation of a periodic self-rehydrating cache, where the user has access to two APIs that resemble a [HashMap][1] and allow to:
+The goal of this little project is to show step by step how to write a small and basic Rust implementation of a periodic self-rehydrating cache, where the user has access to two main APIs that resemble a [HashMap][1] and allow to:
 - Insert a key-value pair along with:
     - Time To Live (TTL): interval of time after which the value is evicted from the cache. It effectively represents our simple cache replacement policy.
-    - Update interval: interval of time after which (if the TTL has not yet expired) to call an asynchronous function that will allow to update the value stored in the cache.
+    - Update interval: interval of time after which, if the TTL has not yet expired, to call an asynchronous function that will allow to update the value stored in the cache.
     - The asynchronous update function.
 - Get the most recent value associated with a given key.
 
-This kind of caching mechanism can be useful when we need to work with data that can be retrieved concurrently and doesn't change very often. As an example, throughout this article we will work with a cache where we are going to store the prices of electronic components, which can be retrieved by querying the web servers of 3rd party manufacturers via HTTP calls.
+This kind of caching mechanism can be useful when we need to work with data that can be retrieved concurrently and doesn't change very often. As an example, throughout this article we will work with a cache where we are going to store the price of electronic components, which can be retrieved by querying the web servers of 3rd party manufacturers via HTTP calls.
 
 
 ## The asynchronous runtime
@@ -24,7 +24,7 @@ For this use case, I chose [Tokio][2], arguably one of the most complete and bes
 
 ## The Cache data structure
 
-As already mentioned, our cache is going to behave very similarly to a hash table; we can start then to define it as follows:
+As already mentioned, our cache is going to behave very similarly to a hash table; we can start by defining it as follows:
 
 ```rust
 use std::collections::HashMap;
@@ -34,13 +34,13 @@ pub struct Cache<K, V> {
 }
 ```
 
-From the above definition, we can see how our cache will be generic over its type parameters `K` (for the key type) and `V` (for the value type). Note how we are not storing `V` directly as value in our hash table, but instead `V` is wrapped in a new type `CacheVal<V>` that we are yet to define. This is because we need to communicate with the cache that any value has been updated by a background task when the update interval is met.
+From the above definition, we can see how our cache will be generic over its type parameters `K` (for the key type) and `V` (for the value type). Note how we are not storing `V` directly as value in our hash table, but instead `V` is wrapped in a new type `CacheVal<V>` that we are yet to define. This is because we are going to exploit the type properties of `CacheVal<V>` to communicate with the cache when a value `V` is updated by a background task.
 
 To understand how to make this possible, we need to think about what we want to achieve:
 
-- Shared ownership: The value stored in the cache should also be accessible by a background task that can change its value, and which should not have access to the whole cache but only to what are its immediate concerns.
+- Shared ownership: The value stored in the cache should also be accessible by a background task that can change its value, and which ideally should not have access to the whole cache.
 
-    Following this requirement, the default wrapper for our values `V` is [Rc][5], a single-threaded reference-counting pointer, which provides shared ownership of a value of type `V`. We can use reference-counting pointers to share references to the same heap allocation of the same instance by, for example, passing its [Clone][6] to the background task.
+    Following this requirement, the default wrapper for our values `V` is [Rc][5], a single-threaded reference-counting pointer, which provides shared ownership of a value of type `V`. We can use reference-counting pointers to share references to the same heap allocation of the same value by, for example, passing its [Clone][6] to the background task.
 
     ```rust
     use std::rc::Rc;
@@ -48,7 +48,7 @@ To understand how to make this possible, we need to think about what we want to 
     pub type CacheVal<V> = Rc<V>; 
     ```
 
-- Thread-safety: each value can be associated with a lightweight and non-blocking different background task, and each spawned task can be executed concurrently to other tasks by the runtime. This can happen on the same thread that spawned the task, but they may also be sent to a different thread depending on the runtime configuration, which in our case will be multi-threaded.
+- Thread-safety: each value can be associated with its own lightweight and non-blocking background task, and each task can run concurrently to the other tasks. This can happen on the same thread that spawned the task, but it may also be sent to a different thread depending on the runtime configuration, which in our case will be multi-threaded.
 
     Following this requirement, we need to change `Rc` to [Arc][7]. Unlike `Rc<V>`, `Arc<V>` uses atomic operations for its reference counting, making it thread-safe (at the expense of the more costly atomic operations required to update the reference count).
 
@@ -60,8 +60,8 @@ To understand how to make this possible, we need to think about what we want to 
 
 - (Interior) Mutability: each background task needs to be able to change the value it is in charge of updating, so that the most up to date value can be reflected by what is returned to the user when querying the cache.
 
-    Shared references in Rust disallow mutation by default, and `Arc` is no exception: we cannot obtain a mutable reference to our values `V` inside an `Arc<V>`. Basically, we need to be able to mutate `V` while having multiple aliases. In Rust, this is achieved using a pattern called interior mutability. A type has interior mutability if its internal state can be changed through a shared reference to it.
-    To achieve this, we can make use of mutexes, and since the data `V` we are going to protect can be accessed by both the background task and the user (via the cache APIs) in a separate thread, we can avoid blocking the user thread that is trying to acquire the lock if the background task has locked it already (and vice-versa) by using an asynchronous mutex provided by Tokio, which in this case will yield execution back to the executor. Moreover, since we can differentiate between read (eg: getting the value from the cache) and write (eg: setting the updated value in the background task) operations, we are going to use the [RwLock][25] asynchronous reader-writer lock provided by Tokio.
+    In Rust, shared references such as `Arc` in Rust disallow mutation by default: we cannot obtain a mutable reference to our values `V` when stored inside an `Arc<V>`. However, we need to be able to mutate `V` while having multiple aliases. This can be achieved using a pattern called interior mutability. A type has interior mutability if its internal state can be changed through a shared reference to it.
+    To achieve this, we can make use of mutexes, and since the data `V` we are going to protect can be accessed by both the background task and the user (via the cache APIs) in a separate thread, we can avoid blocking the user thread that is trying to acquire the lock when the background task has locked it already (and vice-versa) by using an asynchronous mutex provided by Tokio, which in this scenario will yield execution back to the runtime. Moreover, since we can differentiate between read (eg: getting the value from the cache) and write (eg: setting the updated value in the background task) operations, we are going to use a [RwLock][25] asynchronous reader-writer lock.
 
     ```rust
     use std::sync::Arc;
@@ -72,7 +72,7 @@ To understand how to make this possible, we need to think about what we want to 
 
 - Eviction: finally, we need to be able to encode in our type the information that will tell us if the value associated with a given cache key has been evicted, due to the expiration of the TTL, or if its value is still considered valid.
 
-    We can express this requirement in the type system by allowing our values to be always either valid or evicted via one of the most common Rust tagged unions: [Option][8]. When the value is set to `Some` it will represent a valid value, otherwise it will be set and returned to the user as `None` when the TTL has expired.
+    We can express this requirement in the type system by allowing our values to be always either valid or evicted via one of the most common Rust tagged union types: [Option][8]. When the value is set to `Some` it will represent a valid value, otherwise it will be set and returned to the user as `None` when the TTL has expired.
 
      ```rust
     use std::sync::Arc;
@@ -82,7 +82,7 @@ To understand how to make this possible, we need to think about what we want to 
     ```
 
 
-Going back to our cache, what we are missing is a way to construct the cache with initially no elements. To do so, we are going to manually implement the [Default][22] trait. Note how we need to be able to call `Default` for our `Cache<K, V>` even if `V` is a type that does not implement `Default`, therefore simply [deriving Default][23] would not be sufficient.
+Going back to our cache, what we are missing is a way to construct an instance of it with initially no elements. To do so, we are going to manually implement the [Default][22] trait. Note how we need to be able to call `Default` for our `Cache<K, V>` even if `V` is a type that does not implement `Default`, therefore simply [deriving Default][23] would not be sufficient.
 
 ```rust
 impl<K, V> Default for Cache<K, V> {
@@ -97,16 +97,16 @@ impl<K, V> Default for Cache<K, V> {
 
 ## CacheVal behavior
 
-So far, we have been able to define the `Cache` data structure and, in particular, define how values are going to be stored, so that they can be accessed by both the user and the background task in charge of updating their value, by wrapping them in a new type alias `CacheVal<V>`. Type aliases in Rust allow us to define a new name to an existing type.
+So far, we have been able to define the `Cache` data structure and, in particular, define how values are going to be stored, so that they can be accessed by both the user and the background task in charge of updating their value, by wrapping them in a new type alias `CacheVal<V>`. Type aliases in Rust allow us to simply define a new name for an existing type.
 
-Although `CacheVal<V>` is a simple type, we would still like to define its minimal behavior by implementing a few traits that will become useful later on and make the API more convenient for the user of this type. For example, we could implement a constructor that takes a `V` and simply returns a `CacheVal<V>`, or we could implement the trait [Debug][9] for `CacheVal<V>` (when `V` implements `Debug`). To do this, we can create a new tuple struct type with a single field.
+Although `CacheVal<V>` is a type with basic semantics, we would still like to define its basic behavior by implementing a few traits that will become useful later on and make the API more convenient for the user of this type. For example, we could implement a constructor that takes a `V` and simply returns a `CacheVal<V>`, or we could implement the trait [Debug][9] for `CacheVal<V>` (when `V` implements `Debug`). To do this, we can start by creating a new tuple struct type with a single field.
 
 ```rust
 #[derive(Debug)]
 pub struct CacheVal<V>(Arc<RwLock<Option<V>>>);
 ```
 
-The first useful trait we are going to implement is [Clone][6]; this follows the shared ownership requirement that we discussed before, which implies we now need to be able to clone an instance of `CacheVal<V>`. Invoking clone on `CacheVal<V>` will produce a new `CacheVal<V>` instance, which points to the same allocation on the heap as the source `CacheVal<V>`, while increasing its reference count. Note how we need to be able to `Clone` our `CacheVal<V>` even if `V` is a type that cannot be cloned, therefore simply [deriving Clone][12] would not be sufficient unless we can always guarantee that `V` is also clonable (which is not a requirement for us).
+The first useful trait we are going to implement is [Clone][6]; this follows the shared ownership requirement that we discussed before, which implies we now need to be able to clone an instance of `CacheVal<V>`. Invoking clone on `CacheVal<V>` will produce a new `CacheVal<V>` instance, which points to the same allocation on the heap as the source `CacheVal<V>`, while increasing its reference count. Note how we need to be able to `Clone` our `CacheVal<V>` even if `V` is a type that cannot be cloned, therefore, similarly to what we have seen for the cache `Default` trait implementation, simply [deriving Clone][12] would not be sufficient unless we can always guarantee that `V` is also clonable (which is not a requirement for us).
 
 ```rust
 impl<V> Clone for CacheVal<V> {
@@ -116,7 +116,7 @@ impl<V> Clone for CacheVal<V> {
 }
 ```
 
-Similarly, for the principle of [eagerly implementing applicable common traits][24], we are going to implement [Default][22] for `CacheVal<V>`, so that by default its inner value is initialized to `None`:
+Likewise, for the principle of [eagerly implementing common traits][24], we are going to implement [Default][22] for `CacheVal<V>`, so that by default its inner value is initialized to `None`:
 
 ```rust
 impl<V> Default for CacheVal<V> {
@@ -126,7 +126,7 @@ impl<V> Default for CacheVal<V> {
 }
 ```
 
-In order to give immutable access to the `struct` field (and avoid declaring the field public as well as accessing it via tuple indexing), we simply need to implement the [Deref][10] trait. Treating our smart pointer `CacheVal<V>` like a regular reference is called [deref coercion][11] and can conveniently work by being implicitly applied by the compiler so that writing function and method calls doesn't require the addition of as many explicit references and dereferences with `&` and `*`.
+In order to give immutable access to the `struct` field (and avoid declaring the field public as well as having to access it via tuple indexing), we simply need to implement the [Deref][10] trait. Treating our smart pointer `CacheVal<V>` like a regular reference to its field is called [deref coercion][11] and can conveniently work by being implicitly applied by the compiler so that writing function and method calls doesn't require the addition of as many explicit references and dereferences with `&` and `*`.
 
 ```rust
 use std::ops::Deref;
@@ -140,7 +140,7 @@ impl<V> Deref for CacheVal<V> {
 }
 ```
 
-Finally, we are going to implement a simple constructor for `CacheVal<V>`, which constructs a new instance of `CacheVal<V>` given ownership of an instance of type `V`:
+Finally, we are going to implement a simple constructor for `CacheVal<V>`, which constructs a new instance of `CacheVal<V>` when given ownership of an instance of type `V`:
 
 ```rust
 impl<V> CacheVal<V> {
@@ -150,7 +150,7 @@ impl<V> CacheVal<V> {
 }
 ```
 
-All the above allows us work with `CacheVal<V>` by possibly exposing simple APIs:
+All the above allows us to work with `CacheVal<V>` by possibly exposing simple APIs:
 
 ```rust
 #[derive(Debug, Clone)]
@@ -163,6 +163,9 @@ let val = CacheVal::new(Component { price: 10.0 });
 
 // asynchronous mutex lock to read inner value
 println!("{:?}", val.read().await);     // Some(Component { price: 10.0 })
+
+// default value is set to None
+println!("{:?}", CacheVal::<Component>::default().read().await); // None
 
 // clone shared reference
 let val2 = CacheVal::clone(&val);
@@ -192,7 +195,7 @@ pub struct TaskArgs<V, UpdateFn> {
 }
 ```
 
-The `ttl` and `update_interval` fields are self-explanatory, while `value` is the cache value that is shared between the task and the cache that will be updated by calling the fourth field `update_fn`.
+The `ttl` and `update_interval` fields are self-explanatory, while `value` is the cache value that is shared between the task and the cache itself, and will be updated by calling the `UpdateFn` stored in the fourth field of this `struct`.
 
 What's missing next is the implementation of the background task; its logic is relatively simple: continue to update the cache value by calling the update function at every update interval of time until the TTL expires, at which point evict the cache value and terminate the task. Fortunately, Tokio provides us all the time primitives and features to detect when a specific (or multiple) interval of time has elapsed in an asynchronous fashion.
 
@@ -231,11 +234,13 @@ where
 
 The trait bounds of the generic type parameter `UpdateFn` state that it must implement a call operator [Fn][13] that operates over the input value of type `CacheVal<V>` and returns a generic output type `Out` that represents the result of an asynchronous computation, aka [Future][17].
 
-Note how passing the whole `CacheVal<V>` to the update function gives us finer granularity over when to mutably request access to the inner value `V` by letting the implementer of the update function decide when to lock the mutex, rather than locking prior to the call to the update function and passing a mutex guard to it.
+Note how passing the whole `CacheVal<V>` to the update function gives finer granularity over when to mutably request access to the inner value `V` by letting the implementer of the update function decide when to lock the mutex, rather than locking prior to the call to the update function and passing a mutex guard to it.
 
 Assuming we already have a Tokio runtime running, the `timer` function can be used as follow:
 
 ```rust
+use tokio::time::Instant;
+
 let start = Instant::now();
 let component = Component { price: 10.0 };
 
@@ -246,30 +251,30 @@ let args = TaskArgs {
     update_fn: update_price,
 };
 
-async fn update_price(cache_val: CacheVal<(Instant, Component)>) {
-    let mut value = cache_val.write().await;
+async fn update_price(value: CacheVal<(Instant, Component)>) {
+    let mut value = value.write().await;
     let (start, component) = value.as_mut().unwrap();
     component.price += 1.0;
 
     println!(
-        "Price at {}s: {:?}",
+        "Price at {}s: {}",
         Instant::now().duration_since(*start).as_secs(),
         component.price
     );
 }
 
 timer(args).await;
-// Price at 1s: 11.0
-// Price at 2s: 12.0
-// Price at 3s: 13.0
-// Price at 4s: 14.0
-// Price at 5s: 15.0
+// Price at 1s: €11
+// Price at 2s: €12
+// Price at 3s: €13
+// Price at 4s: €14
+// Price at 5s: €15
 ```
 
 
 ## The Cache APIs
 
-As previously described in the [Overview](#overview), we are going to implement only two different APIs for our cache: the first one to insert new values associated to a unique key, and the second one to retrieve the most recent value for that key.
+As previously described in the [Overview](#overview), we are going to implement two main APIs for our cache: the first one to insert new values associated to a unique key, and the second one to retrieve the most recent value for that key.
 
 Starting from the `insert` method, the logic here is also relatively simple: we insert a new key value pair in the hash table, where the value is a cloned reference of the `CacheVal<V>` provided as part of the `TaskArgs<V, UpdateFn>`, and we then immediately [spawn][3] a new detached asynchronous task that will run the previously described `timer` function.
 
@@ -280,8 +285,8 @@ impl<K: Eq + Hash, V> Cache<K, V> {
     pub fn insert<UpdateFn, Out>(&mut self, key: K, args: TaskArgs<V, UpdateFn>)
     where
         V: Send + Sync + 'static,
-        Out: Future + Send + 'static,
         UpdateFn: Fn(CacheVal<V>) -> Out + Send + Sync + 'static,
+        Out: Future + Send + 'static,
     {
         self.items.insert(key, CacheVal::clone(&args.value));
         tokio::spawn(timer(args));
@@ -289,7 +294,7 @@ impl<K: Eq + Hash, V> Cache<K, V> {
 }
 ```
 
-Since internally we are using a `HashMap` to store keys and values, it is required that the keys `K` implement the [Eq][18] and [Hash][19] traits, and we are requiring this in the `impl` block as `K: Eq + Hash`; any other trait bounds are left to each specific method implementation.
+Since internally we are using a `HashMap` to store keys and values, it is required that the keys `K` implement the [Eq][18] and [Hash][19] traits, and we are requiring this in the `impl` block as `K: Eq + Hash`; any other trait bounds we will see are left to each specific method implementation.
 
 Let's try now to demystify the trait bounds that we specified as part of the method `where` clause. The signature of the `insert` method allows us to define at compile time the type of the `UpdateFn` and of its return type `Out`. In particular, since we're going to use the `args` as parameter of the `timer` function, we start by specifying the same trait bounds that are required by the `timer` function:
 
@@ -324,7 +329,7 @@ Finally, `V` needs to be restricted to the following trait bounds:
 V: Send + Sync + 'static
 ```
 
-The reason why `V` needs to be `Sync` is quite subtle, but it comes down to the fact that in order for the future spawned by Tokio to be `Send`, our `UpdateFn` argument `CacheVal<V>` also needs to be `Send`. If we revisit the types that are part of `CacheVal<V>`, we'll see that it basically corresponds to an `Arc<RwLock<Option<V>>>` and, from the Rust standard library, we can see that:
+While the `Send + 'static` bounds follow what we have describe above, the reason why `V` needs to be `Sync` is more subtle, but it comes down to the fact that in order for the future spawned by Tokio to be `Send`, our `UpdateFn` argument `CacheVal<V>` also needs to be `Send`. If we revisit the types that are part of `CacheVal<V>`, we'll see that it basically corresponds to an `Arc<RwLock<Option<V>>>` and, from the Rust standard library, we can see that:
 
 ```rust
 // for Arc<T> to be Send T must be Send + Sync
@@ -340,9 +345,9 @@ impl<T: Send> Send for Option<T> {}
 impl<T: Sync> Sync for Option<T> {}
 ```
 
-Therefore, for `CacheVal<V>` to be `Send`, `V` needs to be `Send + Sync`. Note how this requirement could be lifted if we instead used `Mutex<T>` instead of `RwLock<T>`, which only requires `impl<T: Send> Sync for Mutex<T> {}`. This is possible because there will never be multiple immutable references of `T` at the same time, since a `Mutex<T>` always only allows a mutually exclusive access to the data it protects (for both read and write operations).
+Therefore, for `CacheVal<V>` to be `Send`, `V` needs to be `Send + Sync`. Note how this requirement could be lifted if we instead used `Mutex<T>` instead of `RwLock<T>`, which only requires `impl<T: Send> Sync for Mutex<T> {}`. This is allowed because there will never be multiple immutable references of `T` at the same time when using a `Mutex<T>`, as it always only allows a mutually exclusive access to the data it protects (for both read and write operations, while `RwLock<T>` allows to have a finer control over these).
 
-Finally, the `get` method is defined as follows:
+Finally, the cache `get` method is defined as follows:
 
 ```rust
 use std::hash::Hash;
@@ -363,7 +368,7 @@ impl<K: Eq + Hash, V> Cache<K, V> {
 
 There are probably a few interesting points to highlight about this method:
 - It accepts as a key a reference to anything (`Q`) that can be [borrowed][21] from an actual key `K`, allowing us to provide as parameter to this method a different representation of the key. For example, consider the case where your keys (`K`) were `String`, but you can call the `get` method using a `str` (thus avoiding an extra heap allocation); this would now be possible thanks to the `get` API signature and the fact that the standard library provides a `impl Borrow<str> for String`.
-- It returns a [Clone][6] of the value `V`, which is wrapped in an `Option` that will be `None` if the key does not exist in our hash table or if the key has been evicted. It wouldn't be possible to return a reference `&V` to the value as this would effectively represent a reference to the value owned by the lock guard returned by the `RwLock::read` method. This is intuitively correct as otherwise the user of the cache would be able to read a reference to a value that could be changed by the background task without any synchronization mechanism. Instead, we decide to return a copy of the inner value by cloning it. Alternatively, it would be possible to return `Option<CacheVal<V>>`, but this may have some disadvantages depending on the user requirements, such as a less convenient API (effectively this represents an `Option` within an `Option` that can differentiate whether the key was ever inserted in the hash table or it was inserted but then later evicted) and giving the user the possibility of changing the shared inner value itself by exploiting the internal mutability offered by `CacheVal<V>` by calling `RwLock::write`.
+- It returns a [Clone][6] of the value `V`, which is wrapped in an `Option` that will be `None` if the key does not exist in our hash table or if the key has been evicted. It wouldn't be possible to return a reference `&V` to the value as this would effectively represent a reference to the value owned by the lock guard returned by the `RwLock::read` method (local to the `get` method). This is intuitively correct as otherwise the user of the cache would be able to read a reference to a value that could be changed by the background task without any synchronization mechanism. Instead, we decide to return a copy of the inner value by cloning it. Alternatively, it would be possible to return `Option<CacheVal<V>>`, but this may have some disadvantages depending on the user requirements, such as a less convenient API (effectively this represents an `Option` within an `Option` that can differentiate whether the key was ever inserted in the hash table or it was inserted but then later evicted) and giving the user the possibility of changing the shared inner value itself by exploiting the internal mutability offered by `CacheVal<V>` by calling `RwLock::write`.
 
     If you are interested only in part of the value `V` (imagine the case where `V` contains additional data that can be used in the update function but is not important at the time of retrieval), avoiding the `Clone` is also possible by, for example, implementing a map function that returns a new type `U` (defined by the user) from `&V`:
 
@@ -398,6 +403,8 @@ cache.insert(
     },
 );
 
+println!("{:?}", cache.get(":not-found").await);    // None
+
 let transistor = cache.get(":transistor").await.unwrap();
 println!("{transistor:?}"); // Component { price: 10.0 }
 
@@ -411,7 +418,7 @@ println!("{price}");        // 10
 
 ## Error handling
 
-As the last section, we are going to briefly talk about error handling and show how we can use the current APIs to signal that a background task raised an error (for example when querying the 3rd-party service to get the price of the electronic components). Because the background tasks run asynchronously, we can expect our error handling to follow the same pattern.
+As part of the last section, we are going to briefly talk about error handling and show how we can use the current APIs to signal that a background task raised an error (for example when querying the 3rd-party service to get the price of the electronic components). Because the background tasks run asynchronously, we can expect our error handling to follow the same pattern.
 
 There are at least a couple of ways we could support error handling:
 
@@ -438,14 +445,14 @@ There are at least a couple of ways we could support error handling:
         TaskArgs {
             ttl: Duration::from_secs(5),
             update_interval: Duration::from_millis(500),
-            value: CacheVal::new(Ok(Component { price: 10.0 })),
+            value: CacheVal::default(),
             update_fn: update_transistor_price,
         },
     );
 
+    println!("{:?}", cache.get(":transistor").await);           // None
     sleep(Duration::from_secs(1)).await;
-    let transistor = cache.get(":transistor").await.unwrap();
-    println!("{transistor:?}");     // Err("404: Not Found")
+    println!("{:?}", cache.get(":transistor").await.unwrap());  // Err("404: Not Found")
     ```
 
 - Fully asynchronously: where we are interested to know if an error occurred when it occurs and get notified when this happens. In this case, we can still exploit the possibility of defining our own type `V` to support this feature by sending errors using the [mpsc][26] implementation provided by Tokio.
