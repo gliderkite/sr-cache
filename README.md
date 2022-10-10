@@ -14,6 +14,9 @@ The goal of this little project is to show step by step how to write a small and
 
 This kind of caching mechanism can be useful when we need to work with data that can be retrieved concurrently and doesn't change very often. As an example, throughout this article we will work with a cache where we are going to store the price of electronic components, which can be retrieved by querying the web servers of 3rd party manufacturers via HTTP calls.
 
+### Target Audience
+I am targeting people that have read, even partially, [The Rust Book][27] and are looking to dive a bit deeper into the language. At the same time, the implementation of the cache remains naive and what I write about can be considered mostly as educative content rather than an attempt to promote some sort of production ready code.
+
 
 ## The asynchronous runtime
 
@@ -531,3 +534,4 @@ There are at least a couple of ways we could support error handling:
 [24]: https://rust-lang.github.io/api-guidelines/interoperability.html#types-eagerly-implement-common-traits-c-common-traits
 [25]: https://docs.rs/tokio/latest/tokio/sync/struct.RwLock.html
 [26]: https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html
+[27]: https://doc.rust-lang.org/stable/book/
