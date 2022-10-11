@@ -260,7 +260,7 @@ async fn update_price(value: CacheVal<(Instant, Component)>) {
     component.price += 1.0;
 
     println!(
-        "Price at {}s: {}",
+        "Price at {}s: €{}",
         Instant::now().duration_since(*start).as_secs(),
         component.price
     );
